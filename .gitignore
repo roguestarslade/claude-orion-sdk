@@ -29,11 +29,13 @@ Makefile
 compile_commands.json
 
 # IDE
+*.md
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
+
 
 # OS
 .DS_Store
