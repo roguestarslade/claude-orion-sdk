@@ -10,6 +10,9 @@
 # Top-level Makefile (only)
 !/Makefile
 
+# README
+!/README.md
+
 # Submodule pointer (orion-sdk). Required so `git submodule status` works.
 !/external
 
