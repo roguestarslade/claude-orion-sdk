@@ -14,4 +14,6 @@ int cameras_load_or_fetch(octl_ctx_t *ctx, OrionCameras_t *out, int *from_cache)
 
 int telem_active_index(int timeout_ms);
 
+int cmd_camera_set(octl_ctx_t *ctx);
+
 #endif

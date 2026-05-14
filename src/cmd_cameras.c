@@ -4,6 +4,7 @@
 #include "conn.h"
 #include "json_out.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -86,6 +87,26 @@ void cameras_emit(jout_t *j, const char *ip, const OrionCameras_t *c, int active
 
         jout_kv_int(j, "gpio",        s->Gpio);
         jout_kv_int(j, "gpio_active", s->GpioActiveState);
+
+        jout_key(j, "alignment");
+        jout_obj_open(j);
+        jout_key(j, "min_rad"); jout_arr_open(j);
+        jout_dbl(j, s->AlignMin[0]);
+        jout_dbl(j, s->AlignMin[1]);
+        jout_arr_close(j);
+        jout_key(j, "max_rad"); jout_arr_open(j);
+        jout_dbl(j, s->AlignMax[0]);
+        jout_dbl(j, s->AlignMax[1]);
+        jout_arr_close(j);
+        jout_key(j, "min_deg"); jout_arr_open(j);
+        jout_dbl(j, s->AlignMin[0] * (180.0 / M_PI));
+        jout_dbl(j, s->AlignMin[1] * (180.0 / M_PI));
+        jout_arr_close(j);
+        jout_key(j, "max_deg"); jout_arr_open(j);
+        jout_dbl(j, s->AlignMax[0] * (180.0 / M_PI));
+        jout_dbl(j, s->AlignMax[1] * (180.0 / M_PI));
+        jout_arr_close(j);
+        jout_obj_close(j);
         jout_obj_close(j);
     }
     jout_arr_close(j);

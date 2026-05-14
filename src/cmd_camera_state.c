@@ -421,6 +421,7 @@ int cmd_camera(octl_ctx_t *ctx)
     if (strcmp(sub, "fov")    == 0) return cmd_camera_fov(ctx);
     if (strcmp(sub, "zoom")   == 0) return cmd_camera_zoom(ctx);
     if (strcmp(sub, "focus")  == 0) return cmd_camera_focus(ctx);
+    if (strcmp(sub, "set")    == 0) return cmd_camera_set(ctx);
 
     jout_err(stderr, OCTL_USAGE, "unknown_subverb",
              "unknown camera subverb: %s", sub);

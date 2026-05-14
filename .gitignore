@@ -1,41 +1,22 @@
-# Build artifacts
-*.o
-*.obj
-*.a
-*.so
-*.so.*
-*.dylib
-*.dll
-*.exe
-*.out
-*.app
+# Allowlist .gitignore — track only source (.c/.h) and Makefiles.
+# Anything not explicitly re-allowed below is ignored.
 
-# Debug
-*.dSYM/
-*.su
-*.idb
-*.pdb
+/*
 
-# CMake
-build/
-cmake-build-*/
-CMakeCache.txt
-CMakeFiles/
-CMakeScripts/
-cmake_install.cmake
-!**/Makefile.am
-!**/Makefile.in
-compile_commands.json
+# Project metadata
+!/.gitignore
+!/.gitmodules
 
-# IDE
-*.md
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
+# Top-level Makefile (only)
+!/Makefile
 
+# Submodule pointer (orion-sdk). Required so `git submodule status` works.
+!/external
 
-# OS
-.DS_Store
-Thumbs.db
+# Source tree: directory in, then narrow to .c / .h only
+!/src
+/src/*
+!/src/*.c
+!/src/*.h
+
+# Note: tests/ is intentionally NOT re-allowed and stays ignored.

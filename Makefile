@@ -15,6 +15,7 @@ LDLIBS   = -Wl,--start-group -lOrionComm -lOrionUtils -Wl,--end-group -lm -lpthr
 
 SRC     := $(wildcard src/*.c)
 OBJ     := $(SRC:.c=.o)
+HDR     := $(wildcard src/*.h)
 BIN     := orionctl
 
 .PHONY: all clean test sdk sdk-clean sdk-check
@@ -42,15 +43,17 @@ $(UTIL_LIB): $(COMM_LIB)
 sdk: $(COMM_LIB) $(UTIL_LIB)
 
 # orionctl sources include SDK headers (some generated), so .o files have an
-# order-only dep on the libs being built first.
-src/%.o: src/%.c | $(COMM_LIB) $(UTIL_LIB)
+# order-only dep on the libs being built first. The blanket $(HDR) dep is
+# conservative -- any header change forces a full recompile -- which is the
+# right default because shared structs like octl_ctx_t change layout.
+src/%.o: src/%.c $(HDR) | $(COMM_LIB) $(UTIL_LIB)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
 
 $(BIN): $(OBJ) $(COMM_LIB) $(UTIL_LIB)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(OBJ) -o $@ $(LDFLAGS) $(LDLIBS)
 
 tests/test_fov_math: tests/test_fov_math.c src/fov_math.c src/fov_math.h
-	$(CC) $(CFLAGS) tests/test_fov_math.c src/fov_math.c -o $@ -lm
+	$(CC) $(CFLAGS) -I src tests/test_fov_math.c src/fov_math.c -o $@ -lm
 
 test: tests/test_fov_math
 	@./tests/test_fov_math
