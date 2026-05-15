@@ -2,7 +2,12 @@
 #include "conn.h"
 #include "json_out.h"
 
+#ifndef _WIN32
 #include <arpa/inet.h>
+#endif
+#ifndef INET_ADDRSTRLEN
+#define INET_ADDRSTRLEN 16
+#endif
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>

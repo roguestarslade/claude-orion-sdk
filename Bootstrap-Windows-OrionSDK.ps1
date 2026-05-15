@@ -32,10 +32,19 @@
 .PARAMETER SkipBuild
     Stop after codegen; don't run make.
 
+.PARAMETER NoSelfElevate
+    Don't auto-relaunch via UAC if admin is needed. Just error out instead.
+    Useful for CI or when calling from a wrapper that handles elevation.
+
+.PARAMETER SkipWinget
+    Skip winget entirely and go straight to direct GitHub-release downloads.
+    Useful when winget is broken on the target box (0x8a15000f source-cache
+    errors, msstore terms-of-use prompts, corporate Group Policy blocks).
+
 .NOTES
-    Requires elevated PowerShell only if MSYS2 / Git need installing.
-    If a toolchain is already present and Git is too, this can run
-    non-elevated.
+    If installs are needed, the script will trigger a UAC prompt and
+    relaunch itself elevated. If a toolchain is already present and Git
+    is too, no elevation is needed and the script runs as-is.
 
 .EXAMPLE
     PS> Set-ExecutionPolicy -Scope Process Bypass -Force
@@ -46,10 +55,17 @@
 param(
     [string]$WorkDir = (Join-Path $env:USERPROFILE "src"),
     [switch]$ForceInstall,
-    [switch]$SkipBuild
+    [switch]$SkipBuild,
+    [switch]$NoSelfElevate,
+    [switch]$SkipWinget
 )
 
 $ErrorActionPreference = 'Stop'
+
+# Force TLS 1.2 for older Windows PowerShell that defaults to TLS 1.0/1.1
+# (GitHub API requires 1.2+).
+[Net.ServicePointManager]::SecurityProtocol =
+    [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
 # =============================================================================
 # Helpers
@@ -73,6 +89,95 @@ function Test-Admin {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
     (New-Object Security.Principal.WindowsPrincipal($id)).IsInRole(
         [Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+# Same idea as Invoke-Bash but for arbitrary native commands (git, cmd,
+# make, ProtoGen, etc). Drops EAP to 'Continue' so native stderr doesn't
+# halt the script, then checks exit code.
+function Invoke-Native {
+    param(
+        [Parameter(Mandatory)][scriptblock]$ScriptBlock,
+        [int[]]$AllowedExitCodes = @(0),
+        [string]$Description = "native command"
+    )
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        & $ScriptBlock
+        $exit = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $prev
+    }
+    if ($AllowedExitCodes -notcontains $exit) {
+        throw "$Description failed (exit code $exit)"
+    }
+}
+
+# Run a bash command and stream its output. Native binaries like bash,
+# pacman, and make routinely write informational output to stderr; with
+# $ErrorActionPreference='Stop' set globally, PS5.1 converts native stderr
+# into a terminating "NativeCommandError" even when the command exits 0.
+# This helper locally drops EAP to 'Continue' around the call so the
+# command runs to completion, then drives the success check off the
+# actual exit code.
+function Invoke-Bash {
+    param(
+        [Parameter(Mandatory)][string]$BashPath,
+        [Parameter(Mandatory)][string]$Command,
+        [int[]]$AllowedExitCodes = @(0),
+        [string]$Description = "bash command"
+    )
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        & $BashPath -lc $Command 2>&1 | Out-Host
+        $exit = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $prev
+    }
+    if ($AllowedExitCodes -notcontains $exit) {
+        throw "$Description failed (exit code $exit)"
+    }
+}
+
+# Relaunch the script via UAC. Forwards all parameters. The new admin
+# window stays open (-NoExit) so the user can see the install/build output.
+function Invoke-SelfElevate {
+    $scriptPath = $PSCommandPath
+    if (-not $scriptPath) {
+        Write-Error "Cannot determine script path for self-elevation. Re-run elevated manually."
+        exit 1
+    }
+
+    $argList = @(
+        "-NoProfile",
+        "-ExecutionPolicy", "Bypass",
+        "-NoExit",
+        "-File", "`"$scriptPath`""
+    )
+
+    # Forward bound params.
+    if ($PSBoundParameters.ContainsKey('WorkDir')) {
+        $argList += @("-WorkDir", "`"$WorkDir`"")
+    }
+    if ($ForceInstall)   { $argList += "-ForceInstall" }
+    if ($SkipBuild)      { $argList += "-SkipBuild" }
+    if ($SkipWinget)     { $argList += "-SkipWinget" }
+    # NOT forwarding -NoSelfElevate -- if we got here we want to elevate.
+
+    Write-Host ""
+    Write-Host "Elevation required to install Git / MSYS2." -ForegroundColor Yellow
+    Write-Host "Approve the UAC prompt; the elevated window will continue from here." -ForegroundColor Yellow
+    try {
+        Start-Process -FilePath "powershell.exe" `
+                      -ArgumentList $argList `
+                      -Verb RunAs -ErrorAction Stop | Out-Null
+    } catch {
+        Write-Error "UAC declined or elevation failed: $_"
+        exit 1
+    }
+    Write-Host "Elevated session launched. This window can be closed." -ForegroundColor Green
+    exit 0
 }
 
 # Compile a trivial C file with the given gcc. Returns $true on success.
@@ -102,6 +207,165 @@ function Test-IsGnuMake([string]$makePath) {
     } catch {
         return $false
     }
+}
+
+# =============================================================================
+# Install helpers -- winget with repair + direct-download fallbacks
+# =============================================================================
+
+# Attempt to repair a broken winget source cache. Returns $true if repair
+# completed without error. Resolves the common 0x8a15000f failure.
+function Repair-WingetSource {
+    Write-Host "Resetting winget sources..." -ForegroundColor Yellow
+    try {
+        winget source reset --force 2>&1 | Out-Host
+        winget source update 2>&1 | Out-Host
+        return ($LASTEXITCODE -eq 0)
+    } catch {
+        Write-Warning "winget source repair threw: $_"
+        return $false
+    }
+}
+
+# Download a GitHub release asset matching a regex. Returns the local path.
+function Get-GitHubReleaseAsset {
+    param(
+        [Parameter(Mandatory)][string]$Repo,        # e.g. "git-for-windows/git"
+        [Parameter(Mandatory)][string]$NameRegex,   # asset filename regex
+        [string]$DestDir = $env:TEMP
+    )
+    $api = "https://api.github.com/repos/$Repo/releases/latest"
+    $headers = @{ "User-Agent" = "orion-sdk-bootstrap" }
+    Write-Host "Querying GitHub: $api"
+    $release = Invoke-RestMethod -Uri $api -Headers $headers -UseBasicParsing
+    $asset = $release.assets | Where-Object { $_.name -match $NameRegex } | Select-Object -First 1
+    if (-not $asset) {
+        throw "No asset in $Repo latest release matched /$NameRegex/"
+    }
+    $dest = Join-Path $DestDir $asset.name
+    if (Test-Path $dest) { Remove-Item $dest -Force }
+    $sizeMB = [math]::Round($asset.size / 1MB, 1)
+    Write-Host "Downloading $($asset.name) ($sizeMB MB)..."
+    Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $dest `
+        -UseBasicParsing -Headers $headers
+    return $dest
+}
+
+# Direct download + silent install of Git for Windows.
+function Install-GitDirect {
+    $installer = Get-GitHubReleaseAsset `
+        -Repo "git-for-windows/git" `
+        -NameRegex '^Git-.*-64-bit\.exe$'
+    Write-Host "Running Git installer silently..."
+    $proc = Start-Process -FilePath $installer -PassThru -Wait -ArgumentList @(
+        "/VERYSILENT", "/NORESTART", "/NOCANCEL", "/SP-",
+        "/CLOSEAPPLICATIONS", "/RESTARTAPPLICATIONS",
+        '/COMPONENTS="icons,ext\reg\shellhere,assoc,assoc_sh"'
+    )
+    Remove-Item $installer -Force -ErrorAction SilentlyContinue
+    if ($proc.ExitCode -ne 0) {
+        throw "Git installer exited with code $($proc.ExitCode)"
+    }
+}
+
+# Direct download + silent install of MSYS2.
+# Uses the .sfx.exe self-extractor rather than the Qt GUI installer --
+# the SFX is a 7-zip self-extractor with reliable silent flags, while the
+# Qt installer's --confirm-command silent mode is finicky and version-
+# dependent. Tradeoff: SFX skips Start Menu shortcuts and Programs &
+# Features registration, but the SDK build doesn't care.
+function Install-MSYS2Direct {
+    $installer = Get-GitHubReleaseAsset `
+        -Repo "msys2/msys2-installer" `
+        -NameRegex '^msys2-base-x86_64-.*\.sfx\.exe$'
+
+    Write-Host "Extracting MSYS2 base to C:\ (archive contains msys64\)..."
+    # 7-zip SFX switches: -y assume yes, -o<path> output directory.
+    $proc = Start-Process -FilePath $installer -PassThru -Wait `
+        -ArgumentList @("-y", "-oC:\")
+    Remove-Item $installer -Force -ErrorAction SilentlyContinue
+    if ($proc.ExitCode -ne 0) {
+        throw "MSYS2 SFX extractor exited with code $($proc.ExitCode)"
+    }
+
+    $bash = "C:\msys64\usr\bin\bash.exe"
+    if (-not (Test-Path $bash)) {
+        throw "MSYS2 extracted but $bash missing -- archive layout changed?"
+    }
+
+    # First-launch initialization creates /etc/fstab, user home, etc.
+    # Without this, pacman calls later in the script will fail.
+    # The init prints "MSYS2 is starting for the first time..." to stderr,
+    # which is informational -- Invoke-Bash tolerates that gracefully.
+    Write-Host "Running MSYS2 first-launch initialization..."
+    Invoke-Bash -BashPath $bash -Command "true" -Description "MSYS2 first-launch init"
+}
+
+# Install Git: try winget, repair sources on failure, fall back to direct.
+# Verifies success by checking that `git` is on PATH (post-install).
+function Install-Git {
+    if ((Test-Cmd winget) -and -not $script:SkipWinget) {
+        # winget attempt 1
+        Write-Host "Attempting winget install of Git..."
+        winget install --id Git.Git -e --silent `
+            --accept-package-agreements --accept-source-agreements 2>&1 | Out-Host
+        Refresh-Path
+        if (Test-Cmd git) { Write-Host "Git installed via winget." -ForegroundColor Green; return }
+
+        # Repair + winget attempt 2
+        if (Repair-WingetSource) {
+            Write-Host "Retrying winget install of Git..."
+            winget install --id Git.Git -e --silent `
+                --accept-package-agreements --accept-source-agreements 2>&1 | Out-Host
+            Refresh-Path
+            if (Test-Cmd git) { Write-Host "Git installed via winget (post-repair)." -ForegroundColor Green; return }
+        }
+        Write-Warning "winget unable to install Git. Falling back to direct GitHub download."
+    } elseif ($script:SkipWinget) {
+        Write-Host "-SkipWinget set. Using direct GitHub download for Git."
+    } else {
+        Write-Host "winget unavailable. Using direct GitHub download for Git."
+    }
+
+    Install-GitDirect
+    Refresh-Path
+    if (-not (Test-Cmd git)) {
+        throw "Git install failed via both winget and direct download."
+    }
+    Write-Host "Git installed via direct download." -ForegroundColor Green
+}
+
+# Install MSYS2: try winget, repair sources on failure, fall back to direct.
+# Verifies success by checking C:\msys64\usr\bin\bash.exe exists.
+function Install-MSYS2 {
+    $msys2Bash = "C:\msys64\usr\bin\bash.exe"
+
+    if ((Test-Cmd winget) -and -not $script:SkipWinget) {
+        # winget attempt 1
+        Write-Host "Attempting winget install of MSYS2..."
+        winget install --id MSYS2.MSYS2 -e --silent `
+            --accept-package-agreements --accept-source-agreements 2>&1 | Out-Host
+        if (Test-Path $msys2Bash) { Write-Host "MSYS2 installed via winget." -ForegroundColor Green; return }
+
+        # Repair + winget attempt 2
+        if (Repair-WingetSource) {
+            Write-Host "Retrying winget install of MSYS2..."
+            winget install --id MSYS2.MSYS2 -e --silent `
+                --accept-package-agreements --accept-source-agreements 2>&1 | Out-Host
+            if (Test-Path $msys2Bash) { Write-Host "MSYS2 installed via winget (post-repair)." -ForegroundColor Green; return }
+        }
+        Write-Warning "winget unable to install MSYS2. Falling back to direct GitHub download."
+    } elseif ($script:SkipWinget) {
+        Write-Host "-SkipWinget set. Using direct GitHub download for MSYS2."
+    } else {
+        Write-Host "winget unavailable. Using direct GitHub download for MSYS2."
+    }
+
+    Install-MSYS2Direct
+    if (-not (Test-Path $msys2Bash)) {
+        throw "MSYS2 install failed via both winget and direct download."
+    }
+    Write-Host "MSYS2 installed via direct download." -ForegroundColor Green
 }
 
 # =============================================================================
@@ -264,21 +528,22 @@ $needsInstall = $ForceInstall -or -not ($tc -and $tc.Verified)
 # --- 2. Admin check, only if installing ---
 if ($needsInstall -or -not (Test-Cmd git)) {
     if (-not (Test-Admin)) {
-        Write-Error "Need admin to install Git/MSYS2. Re-run elevated, or install them manually and retry."
-        exit 1
+        if ($NoSelfElevate) {
+            Write-Error "Need admin to install Git/MSYS2. Re-run elevated, or install them manually and retry. (-NoSelfElevate is set, so not relaunching automatically.)"
+            exit 1
+        }
+        Invoke-SelfElevate
+        # Invoke-SelfElevate exits; control does not return.
     }
     if (-not (Test-Cmd winget)) {
-        Write-Error "winget missing. Install 'App Installer' from Microsoft Store, then retry."
-        exit 1
+        Write-Warning "winget not found. Will use direct GitHub-release downloads instead."
     }
 }
 
 # --- 3. Git ---
 Write-Stage "Git"
 if (-not (Test-Cmd git)) {
-    winget install --id Git.Git -e --silent `
-        --accept-package-agreements --accept-source-agreements
-    Refresh-Path
+    Install-Git
 } else {
     Write-Host "git present: $(git --version)"
 }
@@ -288,8 +553,7 @@ if ($needsInstall) {
     Write-Stage "Installing MSYS2 (no working toolchain detected)"
     $msys2Root = "C:\msys64"
     if (-not (Test-Path $msys2Root)) {
-        winget install --id MSYS2.MSYS2 -e --silent `
-            --accept-package-agreements --accept-source-agreements
+        Install-MSYS2
         if (-not (Test-Path $msys2Root)) {
             Write-Error "MSYS2 install reported success but $msys2Root missing."
             exit 1
@@ -302,10 +566,18 @@ if ($needsInstall) {
     }
 
     Write-Stage "Updating MSYS2 + installing toolchain"
-    & $bash -lc "pacman -Syu --noconfirm --disable-download-timeout"
-    & $bash -lc "pacman -Syu --noconfirm --disable-download-timeout"
-    & $bash -lc "pacman -S --needed --noconfirm --disable-download-timeout `
-        mingw-w64-x86_64-toolchain mingw-w64-x86_64-make make git"
+    # First-pass: may self-update pacman and force-exit the shell.
+    Invoke-Bash -BashPath $bash `
+        -Command "pacman -Syu --noconfirm --disable-download-timeout" `
+        -Description "pacman first-pass update"
+    # Second-pass: finishes the system update.
+    Invoke-Bash -BashPath $bash `
+        -Command "pacman -Syu --noconfirm --disable-download-timeout" `
+        -Description "pacman second-pass update"
+    # Toolchain install.
+    Invoke-Bash -BashPath $bash `
+        -Command "pacman -S --needed --noconfirm --disable-download-timeout mingw-w64-x86_64-toolchain mingw-w64-x86_64-make make git" `
+        -Description "pacman toolchain install"
 
     Write-Stage "Adding MSYS2 to system PATH"
     $paths = @("$msys2Root\mingw64\bin", "$msys2Root\usr\bin")
@@ -343,11 +615,15 @@ New-Item -ItemType Directory -Force -Path $WorkDir | Out-Null
 $repoDir = Join-Path $WorkDir "orion-sdk"
 if (-not (Test-Path $repoDir)) {
     Set-Location $WorkDir
-    git clone https://github.com/trilliumeng/orion-sdk.git
+    Invoke-Native -Description "git clone" -ScriptBlock {
+        git clone https://github.com/trilliumeng/orion-sdk.git
+    }
 } else {
     Set-Location $repoDir
     Write-Host "Repo present, fetching..."
-    git fetch --tags --prune
+    Invoke-Native -Description "git fetch" -ScriptBlock {
+        git fetch --tags --prune
+    }
 }
 Set-Location $repoDir
 
@@ -356,7 +632,9 @@ Write-Stage "Checking out latest release tag"
 $latestTag = (git tag --sort=-creatordate | Select-Object -First 1)
 if ($latestTag) {
     Write-Host "Tag: $latestTag"
-    git -c advice.detachedHead=false checkout $latestTag
+    Invoke-Native -Description "git checkout $latestTag" -ScriptBlock {
+        git -c advice.detachedHead=false checkout $latestTag
+    }
 } else {
     Write-Warning "No tags found; staying on default branch."
 }
@@ -367,7 +645,9 @@ if (-not (Test-Path ".\GenerateOrionPublicPacketWin.bat")) {
     Write-Error "GenerateOrionPublicPacketWin.bat not at repo root. Wrong branch/tag?"
     exit 1
 }
-cmd /c "GenerateOrionPublicPacketWin.bat"
+Invoke-Native -Description "ProtoGen codegen" -ScriptBlock {
+    cmd /c "GenerateOrionPublicPacketWin.bat"
+}
 $generated = Get-ChildItem ".\Communications\*.h" -ErrorAction SilentlyContinue
 if (-not $generated) {
     Write-Error "ProtoGen produced no headers. Inspect ProtoGen.exe output above."
@@ -385,17 +665,25 @@ if ($SkipBuild) {
 } else {
     Write-Stage "Building SDK"
     if ($tc.Bash) {
-        # Prefer bash — the Makefile is POSIX-style.
+        # Prefer bash -- the Makefile is POSIX-style.
         $repoUnix  = ($repoDir  -replace '\\','/' -replace '^([A-Za-z]):','/$1').ToLower()
         $makeUnix  = ($tc.Make  -replace '\\','/')
-        & $tc.Bash -lc "cd '$repoUnix' && '$makeUnix'"
+        Invoke-Bash -BashPath $tc.Bash `
+            -Command "cd '$repoUnix' && '$makeUnix'" `
+            -Description "make build"
     } else {
         # No bash. Call make directly (works for plain mingw32-make).
-        & $tc.Make
-    }
-    if ($LASTEXITCODE -ne 0) {
-        Write-Error "make exited with $LASTEXITCODE"
-        exit $LASTEXITCODE
+        $prevEAP = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            & $tc.Make
+            $makeExit = $LASTEXITCODE
+        } finally {
+            $ErrorActionPreference = $prevEAP
+        }
+        if ($makeExit -ne 0) {
+            throw "make exited with code $makeExit"
+        }
     }
 }
 

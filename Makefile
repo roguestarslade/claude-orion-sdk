@@ -13,6 +13,19 @@ CPPFLAGS = -I$(COMM_I) -I$(UTIL_I)
 LDFLAGS  = -L$(COMM_L) -L$(UTIL_L)
 LDLIBS   = -Wl,--start-group -lOrionComm -lOrionUtils -Wl,--end-group -lm -lpthread
 
+# Windows (MinGW/MSYS2): the SDK's Types.h checks WIN32, not _WIN32, so we
+# need to define it explicitly. Also link ws2_32 for winsock symbols pulled in
+# by libOrionComm.
+ifeq ($(OS),Windows_NT)
+CPPFLAGS += -DWIN32
+LDLIBS   += -lws2_32 -liphlpapi
+# OrionCommWindows.c:124 calls POSIX close() on a SOCKET (upstream bug).
+# Redefine for the SDK Communications build only; the file's other socket
+# closes already use closesocket(). OrionCommLinux.c is __linux__-guarded
+# so it compiles to nothing here and is unaffected by this rename.
+SDK_COMM_CFLAGS := -Dclose=closesocket
+endif
+
 SRC     := $(wildcard src/*.c)
 OBJ     := $(SRC:.c=.o)
 HDR     := $(wildcard src/*.h)
@@ -33,9 +46,10 @@ sdk-check:
 	fi
 
 # Build the SDK libs on demand. Utils consumes generated headers from
-# Communications, so order matters.
+# Communications, so order matters. SDK_COMM_CFLAGS is set per-platform
+# above; it's appended (via common.mk's `CFLAGS+=`) to the SDK's defaults.
 $(COMM_LIB): | sdk-check
-	$(MAKE) -C $(SDK)/Communications build
+	$(MAKE) -C $(SDK)/Communications build CFLAGS="$(SDK_COMM_CFLAGS)"
 
 $(UTIL_LIB): $(COMM_LIB)
 	$(MAKE) -C $(SDK)/Utils build

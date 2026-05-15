@@ -9,6 +9,13 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#ifdef _WIN32
+#include <direct.h>
+#define orion_mkdir(p) _mkdir(p)
+#else
+#define orion_mkdir(p) mkdir((p), 0700)
+#endif
+
 static int cache_dir(char *out, size_t outsz)
 {
     const char *xdg = getenv("XDG_CACHE_HOME");
@@ -47,11 +54,11 @@ int cache_ensure_dir(void)
     for (; *p; p++) {
         if (*p == '/') {
             *p = 0;
-            if (mkdir(dir, 0700) != 0 && errno != EEXIST) return -1;
+            if (orion_mkdir(dir) != 0 && errno != EEXIST) return -1;
             *p = '/';
         }
     }
-    if (mkdir(dir, 0700) != 0 && errno != EEXIST) return -1;
+    if (orion_mkdir(dir) != 0 && errno != EEXIST) return -1;
     return 0;
 }
 

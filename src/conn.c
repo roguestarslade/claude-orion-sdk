@@ -22,16 +22,22 @@ int conn_open(const char *ip)
     if (!OrionCommIpStringValid(ip)) return -1;
 
     fflush(stdout);
-    int saved = dup(STDOUT_FILENO);
-    int devnull = open("/dev/null", O_WRONLY);
+#ifdef _WIN32
+    const char *nullpath = "NUL";
+#else
+    const char *nullpath = "/dev/null";
+#endif
+    int stdout_fd = fileno(stdout);
+    int saved = dup(stdout_fd);
+    int devnull = open(nullpath, O_WRONLY);
     if (devnull >= 0) {
-        dup2(devnull, STDOUT_FILENO);
+        dup2(devnull, stdout_fd);
         close(devnull);
     }
     int ok = OrionCommOpenNetworkIp(ip);
     fflush(stdout);
     if (saved >= 0) {
-        dup2(saved, STDOUT_FILENO);
+        dup2(saved, stdout_fd);
         close(saved);
     }
     if (!ok) return -1;
